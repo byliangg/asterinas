@@ -61,9 +61,6 @@ pub(crate) struct Ext4 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MountFlavor {
     Ext2,
-    // Constructed once the ext4 type name is registered; the kernel tests
-    // already mount under it.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     Ext4,
 }
 
@@ -217,7 +214,7 @@ impl Ext4 {
         &self.fs_event_subscriber_stats
     }
 
-    #[expect(dead_code)]
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn this(&self) -> Weak<Ext4> {
         self.self_ref.clone()
     }
@@ -789,10 +786,53 @@ mod tests {
     use ostd::prelude::*;
 
     use super::{
-        super::{block_group::RawBlockGroup, test_utils::Ext4FixtureBuilder},
+        super::{
+            block_group::RawBlockGroup,
+            test_utils::{Ext4FixtureBuilder, make_empty_file_inode},
+        },
         *,
     };
     use crate::fs::vfs::file_system::FileSystem as FileSystemTrait;
+
+    const SECTORS_PER_BLOCK: u64 = (BLOCK_SIZE / SECTOR_SIZE) as u64;
+
+    fn write_all(inode: &Inode, offset: usize, data: &[u8]) {
+        let mut reader = VmReader::from(data).to_fallible();
+        let n = inode.write_at(offset, &mut reader).unwrap();
+        assert_eq!(n, data.len());
+    }
+
+    /// Returns whether physical block `pblock` is marked allocated in group 0.
+    fn block_is_allocated(f: &super::super::test_utils::Ext4Fixture, pblock: Ext4Bid) -> bool {
+        let group = f.ext4.block_group(0);
+        group
+            .metadata()
+            .block_bitmap
+            .is_allocated((pblock - group.first_block()) as u16)
+    }
+
+    /// Returns the physical block mapped by a depth-0 extent root.
+    fn ondisk_pblock_of(raw: &RawInode, lblock: u32) -> Option<Ext4Bid> {
+        let entries = (raw.block[0] >> 16) & 0xFFFF;
+        let depth = (raw.block[1] >> 16) & 0xFFFF;
+        if depth != 0 {
+            return None;
+        }
+        for i in 0..entries as usize {
+            let ee_block = raw.block[3 + i * 3];
+            let raw_len = raw.block[4 + i * 3] & 0xFFFF;
+            let len = if raw_len > 32768 {
+                raw_len - 32768
+            } else {
+                raw_len
+            };
+            let ee_start = raw.block[5 + i * 3] as Ext4Bid;
+            if lblock >= ee_block && lblock < ee_block + len {
+                return Some(ee_start + (lblock - ee_block) as Ext4Bid);
+            }
+        }
+        None
+    }
 
     #[ktest]
     fn block_alloc_guard_rolls_back_on_drop() {
@@ -825,6 +865,45 @@ mod tests {
             let bit = (bid - group.first_block()) as u16;
             assert!(!metadata.block_bitmap.is_allocated(bit));
         }
+    }
+
+    /// Ensures filesystem sync keeps truncated inodes and block bitmaps consistent.
+    #[ktest]
+    fn cross_inode_truncate_consistent_after_sync_all() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        f.write_raw_inode(11, &make_empty_file_inode());
+        f.write_raw_inode(12, &make_empty_file_inode());
+
+        let a = f.ext4.read_inode(11).unwrap();
+        write_all(&a, 0, &[0xAA; BLOCK_SIZE]);
+        a.sync_data().unwrap();
+
+        let b = f.ext4.read_inode(12).unwrap();
+        write_all(&b, 0, &[0xBB; 3 * BLOCK_SIZE]);
+        b.sync_data().unwrap();
+
+        let b2_pblock = ondisk_pblock_of(&f.read_raw_inode(12), 2).unwrap();
+        assert!(block_is_allocated(&f, b2_pblock));
+
+        b.resize(BLOCK_SIZE).unwrap();
+        assert_eq!(b.file_size(), BLOCK_SIZE);
+        f.ext4.sync_all().unwrap();
+
+        let raw_b = f.read_raw_inode(12);
+        assert_eq!(raw_b.size_lo, BLOCK_SIZE as u32);
+        assert_eq!(raw_b.sector_count as u64, SECTORS_PER_BLOCK);
+
+        let b0_pblock = ondisk_pblock_of(&raw_b, 0).unwrap();
+        assert!(block_is_allocated(&f, b0_pblock));
+        assert!(ondisk_pblock_of(&raw_b, 2).is_none());
+        assert!(!block_is_allocated(&f, b2_pblock));
+
+        let a0_pblock = ondisk_pblock_of(&f.read_raw_inode(11), 0).unwrap();
+        assert!(block_is_allocated(&f, a0_pblock));
     }
 
     /// create_inode rolls back the inode allocation when the on-disk writeback
@@ -910,6 +989,49 @@ mod tests {
     fn inode_slot_io_honors_inode_size() {
         verify_128_byte_inode_read();
         verify_256_byte_inode_write();
+    }
+
+    /// Verifies the ext2/ext4 mount-flavor feature matrix.
+    #[ktest]
+    fn mount_flavor_decision_matrix() {
+        Ext4FixtureBuilder::new(2048, 256, 2048)
+            .without_extents_feature()
+            .build()
+            .unwrap();
+        Ext4FixtureBuilder::new(2048, 256, 2048)
+            .without_extents_feature()
+            .with_flavor(MountFlavor::Ext2)
+            .build()
+            .unwrap();
+
+        let err = match Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_flavor(MountFlavor::Ext2)
+            .build()
+        {
+            Err(err) => err,
+            Ok(_) => panic!("an extent volume must not mount as ext2"),
+        };
+        assert_eq!(err.error(), Errno::EINVAL);
+
+        Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_extra_compat(0x4)
+            .build()
+            .unwrap();
+        let err = match Ext4FixtureBuilder::new(2048, 256, 2048)
+            .without_extents_feature()
+            .with_extra_compat(0x4)
+            .with_flavor(MountFlavor::Ext2)
+            .build()
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a journaled volume must not mount as ext2"),
+        };
+        assert_eq!(err.error(), Errno::EINVAL);
+
+        Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_extra_ro_compat(0x4)
+            .build()
+            .unwrap();
     }
 
     /// An ext2-format volume (no EXTENTS feature) mounts, creates ext2-format
