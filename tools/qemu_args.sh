@@ -20,6 +20,8 @@
 #  - SMP: number of CPUs;
 #  - MEM: amount of memory, e.g. "8G";
 #  - VNC_PORT: VNC port, default is "42";
+#  - ATTACH_EXT4_IMAGE: "true" or "false", whether to attach the ext
+#    regression image and mount-flavor matrix images.
 #  - XFSTESTS_NEEDS_BLOCK_DEVICES: "true" or "false", whether to attach
 #    xfstests images (xfstests_test.img and xfstests_scratch.img) to the VM.
 
@@ -29,7 +31,13 @@ VSOCK=${VSOCK:-"off"}
 VIRTIOFS=${VIRTIOFS:-"off"}
 NETDEV=${NETDEV:-"user"}
 CONSOLE=${CONSOLE:-"hvc0"}
+ATTACH_EXT4_IMAGE=${ATTACH_EXT4_IMAGE:-false}
 XFSTESTS_NEEDS_BLOCK_DEVICES=${XFSTESTS_NEEDS_BLOCK_DEVICES:-false}
+
+if [ "$ATTACH_EXT4_IMAGE" != "true" ] && [ "$ATTACH_EXT4_IMAGE" != "false" ]; then
+    echo "Invalid ATTACH_EXT4_IMAGE=${ATTACH_EXT4_IMAGE}" 1>&2
+    exit 1
+fi
 
 if [ "$XFSTESTS_NEEDS_BLOCK_DEVICES" != "true" ] && \
    [ "$XFSTESTS_NEEDS_BLOCK_DEVICES" != "false" ]; then
@@ -175,6 +183,19 @@ COMMON_QEMU_ARGS="\
     $ROOTFS_DRIVE_ARGS \
 "
 
+if [ "$ATTACH_EXT4_IMAGE" = "true" ]; then
+    COMMON_QEMU_ARGS="$COMMON_QEMU_ARGS \
+        -drive if=none,format=raw,id=x4,file=./test/initramfs/build/ext4.img \
+    "
+    MATRIX_IDX=0
+    for image in ext2 ext2_i128 ext2_i128_nori ext4_journal ext4_noextents neg_nofiletype neg_rev0 neg_metadata_csum; do
+        COMMON_QEMU_ARGS="$COMMON_QEMU_ARGS \
+            -drive if=none,format=raw,id=mx$MATRIX_IDX,file=./test/initramfs/build/ext_matrix/$image.img \
+        "
+        MATRIX_IDX=$((MATRIX_IDX + 1))
+    done
+fi
+
 # Add xfstests drives when the selected file system needs block devices.
 if [ "$XFSTESTS_NEEDS_BLOCK_DEVICES" = "true" ]; then
     COMMON_QEMU_ARGS="$COMMON_QEMU_ARGS \
@@ -233,6 +254,35 @@ else
         $CONSOLE_ARGS \
         $IOMMU_EXTRA_ARGS \
     "
+fi
+
+if [ "$ATTACH_EXT4_IMAGE" = "true" ]; then
+    if [ "$1" = "microvm" ]; then
+        QEMU_ARGS="$QEMU_ARGS \
+            -device virtio-blk-device,drive=x4,serial=vext4 \
+        "
+    else
+        QEMU_ARGS="$QEMU_ARGS \
+            -device virtio-blk-pci,bus=pcie.0,addr=0xb,drive=x4,serial=vext4,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        "
+    fi
+
+    # Attach after the established regression disk, preserving vda..vdd.
+    MATRIX_ADDR=12
+    MATRIX_IDX=0
+    for image in ext2 ext2_i128 ext2_i128_nori ext4_journal ext4_noextents neg_nofiletype neg_rev0 neg_metadata_csum; do
+        if [ "$1" = "microvm" ]; then
+            QEMU_ARGS="$QEMU_ARGS \
+                -device virtio-blk-device,drive=mx$MATRIX_IDX,serial=mx_$image \
+            "
+        else
+            QEMU_ARGS="$QEMU_ARGS \
+                -device virtio-blk-pci,bus=pcie.0,addr=$(printf 0x%x $MATRIX_ADDR),drive=mx$MATRIX_IDX,serial=mx_$image,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+            "
+        fi
+        MATRIX_ADDR=$((MATRIX_ADDR + 1))
+        MATRIX_IDX=$((MATRIX_IDX + 1))
+    done
 fi
 
 # Add xfstests devices when the selected file system needs block devices.
