@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! VFS inode trait implementations for the ext2 [`Inode`](super::super::Inode).
+//! VFS `FileOps` and `Inode` trait implementations for the ext4 `Inode`.
 //!
-//! Wires the ext2 `Inode` into the VFS layer by implementing the `InodeIo`
-//! and `Inode` traits. The implementation converts VFS requests into
-//! ext2-internal operations, including symlink results and the inode's VFS
-//! extension slot.
+//! Translates VFS requests into ext4-internal operations: data I/O through the
+//! page cache (or directly, for `O_DIRECT`), attribute getters/setters, the
+//! directory namespace (create/mknod/link/unlink/rmdir/rename and symlink
+//! read/write), and special-file opens (devices resolve through the device
+//! registry, named pipes through the inode's in-memory pipe).
 
 use core::time::Duration;
 
-use aster_block::bio::BioStatus;
 use device_id::DeviceId;
 
 use crate::{
@@ -98,7 +98,7 @@ impl Inode for Ext4Inode {
     }
 
     fn set_owner(&self, uid: Uid) -> Result<()> {
-        self.set_uid(uid.into())
+        self.set_uid(u32::from(uid))
     }
 
     fn group(&self) -> Result<Gid> {
@@ -106,7 +106,7 @@ impl Inode for Ext4Inode {
     }
 
     fn set_group(&self, gid: Gid) -> Result<()> {
-        self.set_gid(gid.into())
+        self.set_gid(u32::from(gid))
     }
 
     fn atime(&self) -> Duration {
@@ -114,7 +114,7 @@ impl Inode for Ext4Inode {
     }
 
     fn set_atime(&self, time: Duration) {
-        self.set_atime(time)
+        self.set_atime(time);
     }
 
     fn mtime(&self) -> Duration {
@@ -122,7 +122,7 @@ impl Inode for Ext4Inode {
     }
 
     fn set_mtime(&self, time: Duration) {
-        self.set_mtime(time)
+        self.set_mtime(time);
     }
 
     fn ctime(&self) -> Duration {
@@ -130,7 +130,7 @@ impl Inode for Ext4Inode {
     }
 
     fn set_ctime(&self, time: Duration) {
-        self.set_ctime(time)
+        self.set_ctime(time);
     }
 
     fn page_cache(&self) -> Option<Arc<Vmo>> {
@@ -184,7 +184,7 @@ impl Inode for Ext4Inode {
 
         let new_inode = self.create(name, inode_type, mode.into())?;
         if let Some(device_id) = device_id {
-            // Store the ext2 special-file device encoding in `i_block`.
+            // Store the special-file device encoding in `i_block`.
             new_inode.set_device_id(device_id)?;
         }
 
@@ -218,7 +218,7 @@ impl Inode for Ext4Inode {
         mode: RenameMode,
     ) -> Result<()> {
         if mode == RenameMode::Exchange {
-            return_errno_with_message!(Errno::EINVAL, "RENAME_EXCHANGE is not supported on ext2");
+            return_errno_with_message!(Errno::EINVAL, "RENAME_EXCHANGE is not supported on ext4");
         }
 
         let new_dir_inode = new_dir_inode.downcast_ref::<Ext4Inode>().unwrap();
@@ -237,25 +237,14 @@ impl Inode for Ext4Inode {
     }
 
     fn sync_all(&self) -> Result<()> {
-        self.sync_all()?;
-        let fs = self.fs()?;
-        let block_group = fs.block_group(self.block_group_idx());
-        block_group.sync_inode_table()?;
-        if fs.block_device().sync()? != BioStatus::Complete {
-            return_errno_with_message!(Errno::EIO, "failed to flush block device");
-        }
-        Ok(())
+        self.sync_all()
     }
 
     fn sync_data(&self) -> Result<()> {
-        self.sync_data()?;
+        // fdatasync semantics: the xattr block is deliberately not flushed.
         let fs = self.fs()?;
-        let block_group = fs.block_group(self.block_group_idx());
-        block_group.sync_inode_table()?;
-        if fs.block_device().sync()? != BioStatus::Complete {
-            return_errno_with_message!(Errno::EIO, "failed to flush block device");
-        }
-        Ok(())
+        fs.sync_metadata()?;
+        self.sync_data()
     }
 
     fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
@@ -263,7 +252,6 @@ impl Inode for Ext4Inode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        // The inode must belong to a live filesystem instance.
         self.fs().unwrap()
     }
 
@@ -290,12 +278,6 @@ impl Inode for Ext4Inode {
 
     fn remove_xattr(&self, name: XattrName) -> Result<()> {
         self.remove_xattr(name)
-    }
-}
-
-impl From<FilePerm> for InodeMode {
-    fn from(perm: FilePerm) -> Self {
-        Self::from_bits_truncate(perm.bits() as _)
     }
 }
 

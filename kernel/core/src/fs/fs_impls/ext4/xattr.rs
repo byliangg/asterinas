@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Extended attributes for the ext2 filesystem.
+//! Extended attributes, stored in the ext2-format EA block shared by
+//! ext2 and ext4 (magic `0xEA020000`; no `metadata_csum` support).
 //!
 //! Extended attributes are stored on disk blocks allocated outside of any inode.
 //! The `i_file_acl` field of the on-disk inode points to this allocated block.
@@ -53,7 +54,7 @@
 //!
 //! # Namespace mapping
 //!
-//! The VFS `XattrNamespace` is mapped to ext2's compact `XattrNameIndex`
+//! The VFS `XattrNamespace` is mapped to the on-disk compact `XattrNameIndex`
 //! byte. The full attribute name stored in the VFS layer (e.g., `user.foo`)
 //! is split at the namespace boundary before storage: the index is written to
 //! `name_index` and only the suffix (`foo`) is stored in `name_len` bytes
@@ -185,7 +186,7 @@ impl Xattr {
         self.cache.write().flush()
     }
 
-    /// Parses a VFS [`XattrName`] into the ext2 `(name_index, name_suffix)` pair.
+    /// Parses a VFS [`XattrName`] into the on-disk `(name_index, name_suffix)` pair.
     fn parse_target_name(name: XattrName) -> Result<(XattrNameIndex, Vec<u8>)> {
         let name_index = XattrNameIndex::from(name.namespace());
         let stripped_name = name_index.strip_prefix(name.full_name())?;
@@ -196,7 +197,7 @@ impl Xattr {
     }
 }
 
-/// Persistent state for an ext2 xattr block.
+/// Persistent state for an EA block.
 ///
 /// Tracks the block buffer, block number, decoded entries, and dirty flag for
 /// one inode.
@@ -222,7 +223,7 @@ impl XattrCache {
     fn fs(&self) -> Result<Arc<Ext4>> {
         self.fs
             .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "ext2 instance is unavailable"))
+            .ok_or_else(|| Error::with_message(Errno::EIO, "ext4 instance is unavailable"))
     }
 
     fn inode(&self) -> Result<Arc<Inode>> {
@@ -644,7 +645,7 @@ impl XattrCache {
         Ok(entries)
     }
 }
-/// The ext2 xattr namespace index stored in `name_index`.
+/// The xattr namespace index stored in `name_index`.
 ///
 /// Determines the namespace prefix prepended to the attribute name
 /// (e.g., `user.`, `security.`).
@@ -727,7 +728,7 @@ struct XattrEntryData {
     value: Vec<u8>,
 }
 
-/// On-disk header of an ext2 extended-attribute block (32 bytes).
+/// On-disk header of an extended-attribute block (32 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
 struct XattrHeader {
